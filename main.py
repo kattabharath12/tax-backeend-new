@@ -20,6 +20,23 @@ from passlib.context import CryptContext
 import uvicorn
 import shutil
 
+# Get port from environment (Railway sets PORT)
+PORT = int(os.getenv("PORT", 8000))
+
+# Database URL with Railway PostgreSQL
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Update SSL configuration for Railway PostgreSQL
+connect_args = {}
+if DATABASE_URL and "postgresql" in DATABASE_URL:
+    # Railway PostgreSQL requires SSL
+    connect_args = {
+        "sslmode": "require",
+        "connect_timeout": 10,
+    }
+elif DATABASE_URL and "sqlite" in DATABASE_URL:
+    connect_args = {"check_same_thread": False}
+
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./taxbox.db")
 
@@ -715,4 +732,4 @@ def create_payment(
     return db_payment
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
