@@ -730,6 +730,11 @@ def create_payment(
     db.commit()
     db.refresh(db_payment)
     return db_payment
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow()}
+
+PORT = int(os.getenv("PORT", 8000))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
