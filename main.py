@@ -1,13 +1,13 @@
 import os
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables FIRST
 load_dotenv()
 
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
@@ -23,21 +23,7 @@ import shutil
 # Get port from environment (Railway sets PORT)
 PORT = int(os.getenv("PORT", 8000))
 
-# Database URL with Railway PostgreSQL
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Update SSL configuration for Railway PostgreSQL
-connect_args = {}
-if DATABASE_URL and "postgresql" in DATABASE_URL:
-    # Railway PostgreSQL requires SSL
-    connect_args = {
-        "sslmode": "require",
-        "connect_timeout": 10,
-    }
-elif DATABASE_URL and "sqlite" in DATABASE_URL:
-    connect_args = {"check_same_thread": False}
-
-# Database setup
+# Database setup with proper Railway PostgreSQL configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./taxbox.db")
 
 # Add SSL configuration for PostgreSQL
@@ -211,7 +197,12 @@ class PaymentResponse(BaseModel):
 Base.metadata.create_all(bind=engine)
 
 # FastAPI App
-app = FastAPI(title="TaxBox.AI API", version="1.0.0")
+app = FastAPI(
+    title="TaxBox.AI API", 
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 # CORS middleware
 app.add_middleware(
@@ -283,7 +274,19 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 # Routes
 @app.get("/")
 def root():
-    return {"message": "TaxBox.AI API is running"}
+    return {
+        "message": "TaxBox.AI API is running",
+        "status": "healthy",
+        "version": "1.0.0"
+    }
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "database": "connected"
+    }
 
 @app.post("/register", response_model=UserResponse)
 def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -518,12 +521,54 @@ def get_processing_status(
         "total_documents": sum(count for _, count in status_counts)
     }
 
-@router.post("/tax-returns/from-document/{document_id}", response_model=TaxReturnResponse)
+@app.post("/tax-returns", response_model=TaxReturnResponse)
+def create_tax_return(
+    tax_return: TaxReturnCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create a new tax return"""
+    
+    # Tax calculation
+    total_income = tax_return.income
+    deductions = tax_return.deductions or 12550  # Standard deduction
+    taxable_income = max(0, total_income - deductions)
+
+    # Simplified tax calculation
+    if taxable_income <= 10275:
+        tax_owed = taxable_income * 0.10
+    elif taxable_income <= 41775:
+        tax_owed = 1027.50 + (taxable_income - 10275) * 0.12
+    else:
+        tax_owed = 4807.50 + (taxable_income - 41775) * 0.22
+
+    refund_amount = max(0, tax_return.withholdings - tax_owed)
+    amount_owed = max(0, tax_owed - tax_return.withholdings)
+
+    db_tax_return = TaxReturn(
+        user_id=current_user.id,
+        tax_year=tax_return.tax_year,
+        income=tax_return.income,
+        deductions=deductions,
+        withholdings=tax_return.withholdings,
+        tax_owed=tax_owed,
+        refund_amount=refund_amount,
+        amount_owed=amount_owed,
+        status="draft"
+    )
+    db.add(db_tax_return)
+    db.commit()
+    db.refresh(db_tax_return)
+    return db_tax_return
+
+@app.post("/tax-returns/from-document/{document_id}", response_model=TaxReturnResponse)
 def create_tax_return_from_document(
     document_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """Create tax return from processed document"""
+    
     document = db.query(Document).filter(
         Document.id == document_id,
         Document.user_id == current_user.id
@@ -563,37 +608,6 @@ def create_tax_return_from_document(
     db.commit()
     db.refresh(db_tax_return)
     return db_tax_return
-    # Tax calculation
-    total_income = tax_return.income
-    deductions = tax_return.deductions or 12550  # Standard deduction
-    taxable_income = max(0, total_income - deductions)
-
-    # Simplified tax calculation
-    if taxable_income <= 10275:
-        tax_owed = taxable_income * 0.10
-    elif taxable_income <= 41775:
-        tax_owed = 1027.50 + (taxable_income - 10275) * 0.12
-    else:
-        tax_owed = 4807.50 + (taxable_income - 41775) * 0.22
-
-    refund_amount = max(0, tax_return.withholdings - tax_owed)
-    amount_owed = max(0, tax_owed - tax_return.withholdings)
-
-    db_tax_return = TaxReturn(
-        user_id=current_user.id,
-        tax_year=tax_return.tax_year,
-        income=tax_return.income,
-        deductions=deductions,
-        withholdings=tax_return.withholdings,
-        tax_owed=tax_owed,
-        refund_amount=refund_amount,
-        amount_owed=amount_owed,
-        status="draft"
-    )
-    db.add(db_tax_return)
-    db.commit()
-    db.refresh(db_tax_return)
-    return db_tax_return
 
 @app.get("/tax-returns")
 def get_tax_returns(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -616,52 +630,6 @@ def export_tax_return_json(
     if not tax_return:
         raise HTTPException(status_code=404, detail="Tax return not found")
     
-    from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-from fastapi.responses import FileResponse
-
-@app.get("/tax-returns/{tax_return_id}/export/pdf")
-def export_tax_return_pdf(
-    tax_return_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    tax_return = db.query(TaxReturn).filter(
-        TaxReturn.id == tax_return_id,
-        TaxReturn.user_id == current_user.id
-    ).first()
-    
-    if not tax_return:
-        raise HTTPException(status_code=404, detail="Tax return not found")
-
-    file_path = f"tax_return_{tax_return.tax_year}_{current_user.id}.pdf"
-
-    c = canvas.Canvas(file_path, pagesize=letter)
-    c.setFont("Helvetica", 12)
-    y = 750
-
-    c.drawString(100, y, f"Tax Return Summary for {current_user.full_name}")
-    y -= 30
-    c.drawString(100, y, f"Email: {current_user.email}")
-    y -= 30
-    c.drawString(100, y, f"Year: {tax_return.tax_year}")
-    y -= 30
-    c.drawString(100, y, f"Income: ${tax_return.income:,.2f}")
-    y -= 30
-    c.drawString(100, y, f"Deductions: ${tax_return.deductions:,.2f}")
-    y -= 30
-    c.drawString(100, y, f"Tax Owed: ${tax_return.tax_owed:,.2f}")
-    y -= 30
-    c.drawString(100, y, f"Refund: ${tax_return.refund_amount:,.2f}")
-    y -= 30
-    c.drawString(100, y, f"Amount Owed: ${tax_return.amount_owed:,.2f}")
-    y -= 30
-    c.drawString(100, y, f"Status: {tax_return.status}")
-
-    c.save()
-
-    return FileResponse(file_path, media_type="application/pdf", filename=file_path)
-
     # Create comprehensive JSON data
     export_data = {
         "tax_summary": {
@@ -713,6 +681,57 @@ def export_tax_return_pdf(
         }
     )
 
+@app.get("/tax-returns/{tax_return_id}/export/pdf")
+def export_tax_return_pdf(
+    tax_return_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Export tax return as PDF file"""
+    
+    tax_return = db.query(TaxReturn).filter(
+        TaxReturn.id == tax_return_id,
+        TaxReturn.user_id == current_user.id
+    ).first()
+    
+    if not tax_return:
+        raise HTTPException(status_code=404, detail="Tax return not found")
+
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas
+        
+        file_path = f"tax_return_{tax_return.tax_year}_{current_user.id}.pdf"
+
+        c = canvas.Canvas(file_path, pagesize=letter)
+        c.setFont("Helvetica", 12)
+        y = 750
+
+        c.drawString(100, y, f"Tax Return Summary for {current_user.full_name}")
+        y -= 30
+        c.drawString(100, y, f"Email: {current_user.email}")
+        y -= 30
+        c.drawString(100, y, f"Year: {tax_return.tax_year}")
+        y -= 30
+        c.drawString(100, y, f"Income: ${tax_return.income:,.2f}")
+        y -= 30
+        c.drawString(100, y, f"Deductions: ${tax_return.deductions:,.2f}")
+        y -= 30
+        c.drawString(100, y, f"Tax Owed: ${tax_return.tax_owed:,.2f}")
+        y -= 30
+        c.drawString(100, y, f"Refund: ${tax_return.refund_amount:,.2f}")
+        y -= 30
+        c.drawString(100, y, f"Amount Owed: ${tax_return.amount_owed:,.2f}")
+        y -= 30
+        c.drawString(100, y, f"Status: {tax_return.status}")
+
+        c.save()
+
+        return FileResponse(file_path, media_type="application/pdf", filename=file_path)
+    
+    except ImportError:
+        raise HTTPException(status_code=500, detail="PDF generation not available")
+
 @app.post("/payments", response_model=PaymentResponse)
 def create_payment(
     payment: PaymentCreate,
@@ -730,11 +749,11 @@ def create_payment(
     db.commit()
     db.refresh(db_payment)
     return db_payment
-@app.get("/health")
-def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
-
-PORT = int(os.getenv("PORT", 8000))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=PORT,
+        log_level="info"
+    )
